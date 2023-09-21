@@ -1,138 +1,121 @@
 pipeline {
-  agent any
-  tools {
-  
-  maven 'maven'
-   
-  }
-    stages {
-
-      stage ('Checkout SCM'){
-        steps {
-          checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'git', url: 'https://iwayqtech@bitbucket.org/iwayqtech/devops-pipeline-project.git']]])
+    
+	agent any
+/*	
+	tools {
+        maven "maven3"
+    }
+*/	
+    environment {
+        NEXUS_VERSION = "nexus3"
+        NEXUS_PROTOCOL = "http"
+        NEXUS_URL = "172.31.40.209:8081"
+        NEXUS_REPOSITORY = "vprofile-release"
+	NEXUS_REPO_ID    = "vprofile-release"
+        NEXUS_CREDENTIAL_ID = "nexuslogin"
+        ARTVERSION = "${env.BUILD_ID}"
+    }
+	
+    stages{
+        
+        stage('BUILD'){
+            steps {
+                sh 'mvn clean install -DskipTests'
+            }
+            post {
+                success {
+                    echo 'Now Archiving...'
+                    archiveArtifacts artifacts: '**/target/*.war'
+                }
+            }
         }
-      }
-	  
-	  stage ('Build')  {
-	      steps {
+
+	stage('UNIT TEST'){
+            steps {
+                sh 'mvn test'
+            }
+        }
+
+	stage('INTEGRATION TEST'){
+            steps {
+                sh 'mvn verify -DskipUnitTests'
+            }
+        }
+		
+        stage ('CODE ANALYSIS WITH CHECKSTYLE'){
+            steps {
+                sh 'mvn checkstyle:checkstyle'
+            }
+            post {
+                success {
+                    echo 'Generated Analysis Result'
+                }
+            }
+        }
+
+        stage('CODE ANALYSIS with SONARQUBE') {
           
-            dir('java-source'){
-            sh "mvn package"
+		  environment {
+             scannerHome = tool 'sonarscanner4'
+          }
+
+          steps {
+            withSonarQubeEnv('sonar-pro') {
+               sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
+                   -Dsonar.projectName=vprofile-repo \
+                   -Dsonar.projectVersion=1.0 \
+                   -Dsonar.sources=src/ \
+                   -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+                   -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                   -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                   -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+            }
+
+            timeout(time: 10, unit: 'MINUTES') {
+               waitForQualityGate abortPipeline: true
+            }
           }
         }
-         
-      }
-   
-     stage ('SonarQube Analysis') {
-        steps {
-              withSonarQubeEnv('sonar') {
-                
-				dir('java-source'){
-                 sh 'mvn -U clean install sonar:sonar'
+
+        stage("Publish to Nexus Repository Manager") {
+            steps {
+                script {
+                    pom = readMavenPom file: "pom.xml";
+                    filesByGlob = findFiles(glob: "target/*.${pom.packaging}");
+                    echo "${filesByGlob[0].name} ${filesByGlob[0].path} ${filesByGlob[0].directory} ${filesByGlob[0].length} ${filesByGlob[0].lastModified}"
+                    artifactPath = filesByGlob[0].path;
+                    artifactExists = fileExists artifactPath;
+                    if(artifactExists) {
+                        echo "*** File: ${artifactPath}, group: ${pom.groupId}, packaging: ${pom.packaging}, version ${pom.version} ARTVERSION";
+                        nexusArtifactUploader(
+                            nexusVersion: NEXUS_VERSION,
+                            protocol: NEXUS_PROTOCOL,
+                            nexusUrl: NEXUS_URL,
+                            groupId: pom.groupId,
+                            version: ARTVERSION,
+                            repository: NEXUS_REPOSITORY,
+                            credentialsId: NEXUS_CREDENTIAL_ID,
+                            artifacts: [
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: artifactPath,
+                                type: pom.packaging],
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: "pom.xml",
+                                type: "pom"]
+                            ]
+                        );
+                    } 
+		    else {
+                        error "*** File: ${artifactPath}, could not be found";
+                    }
                 }
-				
-              }
             }
-      }
-
-    stage ('Artifactory configuration') {
-            steps {
-                rtServer (
-                    id: "jfrog",
-                    url: "http://18.207.136.250:8082/artifactory",
-                    credentialsId: "jfrog"
-                )
-
-                rtMavenDeployer (
-                    id: "MAVEN_DEPLOYER",
-                    serverId: "jfrog",
-                    releaseRepo: "iwayq-libs-release-local",
-                    snapshotRepo: "iwayq-libs-snapshot-local"
-                )
-
-                rtMavenResolver (
-                    id: "MAVEN_RESOLVER",
-                    serverId: "jfrog",
-                    releaseRepo: "iwayq-libs-release",
-                    snapshotRepo: "iwayq-libs-snapshot"
-                )
-            }
-    }
-
-    stage ('Deploy Artifacts') {
-            steps {
-                rtMavenRun (
-                    tool: "maven", // Tool name from Jenkins configuration
-                    pom: 'java-source/pom.xml',
-                    goals: 'clean install',
-                    deployerId: "MAVEN_DEPLOYER",
-                    resolverId: "MAVEN_RESOLVER"
-                )
-         }
-    }
-
-    stage ('Publish build info') {
-            steps {
-                rtPublishBuildInfo (
-                    serverId: "jfrog"
-             )
         }
+
+
     }
 
-    stage('Copy Dockerfile & Playbook to Ansible Server') {
-            
-            steps {
-                  sshagent(['sshkey']) {
-                       
-                        sh "scp -o StrictHostKeyChecking=no Dockerfile ec2-user@3.91.67.214:/home/ec2-user"
-                        sh "scp -o StrictHostKeyChecking=no create-container-image.yaml ec2-user@3.91.67.214:/home/ec2-user"
-                    }
-                }
-            
-        } 
-    stage('Build Container Image') {
-            
-            steps {
-                  sshagent(['sshkey']) {
-                       
-                        sh "ssh -o StrictHostKeyChecking=no ec2-user@3.91.67.214 -C \"sudo ansible-playbook create-container-image.yaml\""
-                        
-                    }
-                }
-            
-        } 
-    stage('Copy Deployent & Service Defination to K8s Master') {
-            
-            steps {
-                  sshagent(['sshkey']) {
-                       
-                        sh "scp -o StrictHostKeyChecking=no create-k8s-deployment.yaml ec2-user@3.237.42.29:/home/ec2-user"
-                        sh "scp -o StrictHostKeyChecking=no nodePort.yaml ec2-user@3.237.42.29:/home/ec2-user"
-                    }
-                }
-            
-        } 
 
-    stage('Waiting for Approvals') {
-            
-        steps{
-
-				input('Test Completed ? Please provide  Approvals for Prod Release ?')
-			  }
-            
-    }     
-    stage('Deploy Artifacts to Production') {
-            
-            steps {
-                  sshagent(['sshkey']) {
-                       
-                        sh "ssh -o StrictHostKeyChecking=no ec2-user@3.237.42.29 -C \"sudo kubectl apply -f create-k8s-deployment.yaml\""
-                        sh "ssh -o StrictHostKeyChecking=no ec2-user@3.237.42.29 -C \"sudo kubectl apply -f nodePort.yaml\""
-                        
-                    }
-                }
-            
-        } 
-         
-   } 
 }
